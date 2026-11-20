@@ -9,9 +9,9 @@ from dotenv import load_dotenv
 
 
 VALID_LOCATIONS = [
-    ("IND", "TN"),
-    ("AUS", "NSW"),
-    ("USA", "CA"),
+    ("IND", "TN", ["600001", "641601", "620001", "625001"]),
+    ("AUS", "NSW", ["2000", "2010", "2150", "2300"]),
+    ("USA", "CA", ["90001", "94105", "92101", "95112"]),
 ]
 
 FIRST_NAMES = [
@@ -33,7 +33,7 @@ STATUSES = ["COMPLETED", "PENDING", "REVERSED"]
 
 CSV_HEADER = (
     "|H|Member_Name|Member_Id|Enrollment_Date|Last_Flight_Date|"
-    "Tier_Code|Agent_Name|State|Country|DOB|Is_Active"
+    "Tier_Code|Agent_Name|State|Country|Post_Code|DOB|Is_Active"
 )
 
 
@@ -73,7 +73,8 @@ def build_member_line(
     last_flight_dt = random_date(2012, today.year)
     dob_dt = random_date(1965, 2002)
 
-    country, state = random.choice(VALID_LOCATIONS)
+    country, state, post_codes = random.choice(VALID_LOCATIONS)
+    post_code = random.choice(post_codes)
     tier_code = random.choice(TIERS)
     agent_name = random.choice(AGENTS)
     is_active = random.choice(["A", "A", "A", "I"])
@@ -83,9 +84,9 @@ def build_member_line(
     dob_str = format_date_field(dob_dt, "mmddyyyy")
 
     if force_bad == "bad_country_phil":
-        country, state = "PHIL", "NCR"
+        country, state, post_code = "PHIL", "NCR", "1000"
     elif force_bad == "bad_country_can":
-        country, state = "CAN", "ONT"
+        country, state, post_code = "CAN", "ONT", "M5V2T6"
     elif force_bad == "missing_name":
         member_name = ""
     elif force_bad == "missing_id":
@@ -111,6 +112,7 @@ def build_member_line(
         agent_name,
         state,
         country,
+        post_code,
         dob_str,
         is_active,
     ]

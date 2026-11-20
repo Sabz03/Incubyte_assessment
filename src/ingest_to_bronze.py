@@ -19,6 +19,7 @@ MEMBER_COLUMNS = [
     "AGENT_NAME",
     "STATE",
     "COUNTRY",
+    "POST_CODE",
     "DOB",
     "IS_ACTIVE",
 ]
@@ -282,6 +283,7 @@ def ingest_member_files(conn: Any, member_files: list[Path], pipeline_run_id: st
                         rec["AGENT_NAME"],
                         rec["STATE"],
                         country_norm,
+                        rec["POST_CODE"],
                         rec["DOB"],
                         rec["IS_ACTIVE"],
                         reject_reason,
@@ -301,6 +303,7 @@ def ingest_member_files(conn: Any, member_files: list[Path], pipeline_run_id: st
                         rec["AGENT_NAME"],
                         rec["STATE"],
                         country_norm,
+                        rec["POST_CODE"],
                         rec["DOB"],
                         rec["IS_ACTIVE"],
                         fp.name,
@@ -314,10 +317,10 @@ def ingest_member_files(conn: Any, member_files: list[Path], pipeline_run_id: st
                 """
                 INSERT INTO BRONZE.RAW_MEMBER_PROFILES (
                     MEMBER_NAME, MEMBER_ID, ENROLLMENT_DATE, LAST_FLIGHT_DATE,
-                    TIER_CODE, AGENT_NAME, STATE, COUNTRY, DATE_OF_BIRTH,
+                    TIER_CODE, AGENT_NAME, STATE, COUNTRY, POST_CODE, DATE_OF_BIRTH,
                     ACTIVE_MEMBER, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
                 """,
                 valid_raw_rows[i : i + CHUNK_SIZE],
             )
@@ -327,10 +330,10 @@ def ingest_member_files(conn: Any, member_files: list[Path], pipeline_run_id: st
                 """
                 INSERT INTO BRONZE.QUARANTINE_MEMBER_PROFILES (
                     MEMBER_NAME, MEMBER_ID, ENROLLMENT_DATE, LAST_FLIGHT_DATE,
-                    TIER_CODE, AGENT_NAME, STATE, COUNTRY, DATE_OF_BIRTH,
+                    TIER_CODE, AGENT_NAME, STATE, COUNTRY, POST_CODE, DATE_OF_BIRTH,
                     ACTIVE_MEMBER, REJECT_REASON, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
                 """,
                 quarantine_rows[i : i + CHUNK_SIZE],
             )
