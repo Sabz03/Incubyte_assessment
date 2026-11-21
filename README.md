@@ -1,71 +1,193 @@
 # SkyPoints Loyalty Data Pipeline
 
-A data pipeline for the **SkyPoints** airline loyalty program built with **Python** and **Snowflake** using a **Medallion Architecture** (`BRONZE`, `SILVER`, `GOLD`) and run tracking (`AUDIT.PIPELINE_AUDIT`).
+End-to-end Snowflake data warehouse pipeline for the **SkyPoints** airline loyalty program, using a medallion architecture (`BRONZE`, `SILVER`, `GOLD`) plus an `AUDIT` schema. It includes local mock data generation, batch ingestion, a stored-procedure transformation, regression checks, and a Streamlit dashboard.
 
-## Architecture Diagram
+**Tech stack:** Python, Snowflake, Streamlit
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture & Layers](#architecture--layers)
+3. [Framework Diagram](#framework-diagram)
+4. [Project Structure](#project-structure)
+5. [Setup & Run](#setup--run)
+6. [Deliverables Map](#deliverables-map)
+
+---
+
+## Overview
+
+Every day the source system delivers two feeds, named `<name>_<YYYYMMDD>`:
+
+| Feed | Format | Contents |
+|------|--------|----------|
+| Member profile feed | Pipe-delimited, `\|H\|` header / `\|D\|` detail records, 11 columns | Member profile data |
+| Partner airline redemption feed | JSON | `member_id`, `feed_date`, `redemptions[]` |
+
+The pipeline loads both feeds into Snowflake, validates them, routes members into **country-specific tables**, applies **"latest record wins"** when a member moves countries, flattens the JSON redemptions, and exposes a Gold summary joining members with their redemptions.
+
+---
+
+## Architecture & Layers
+
+- **Warehouse & Database:** `SKYPOINTS_WH` (`XSMALL`, auto-suspend `60s`, auto-resume enabled) and `SKYPOINTS_DB`.
+- **Schemas:** `BRONZE`, `SILVER`, `GOLD`, and `AUDIT`.
+
+| Layer | Objects | Purpose |
+|-------|---------|---------|
+| **Bronze** | `BRONZE.RAW_MEMBER_PROFILES`, `BRONZE.QUARANTINE_MEMBER_PROFILES` | Raw member rows (append-only) and rejected rows with a reject reason |
+| **Bronze** | `BRONZE.RAW_REDEMPTION_JSON`, `BRONZE.REDEMPTION_JSON_FLAT`, `BRONZE.QUARANTINE_REDEMPTION_JSON` | Raw JSON payloads, flattened redemption rows, and bad JSON / invalid items |
+| **Silver** | `SILVER.TABLE_INDIA`, `SILVER.TABLE_USA`, `SILVER.TABLE_AUS` | Country-partitioned member tables |
+| **Silver** | `SILVER.MEMBER_REDEMPTIONS` | Typed, deduplicated redemption transactions (on `TXN_ID`) |
+| **Silver** | `SILVER.SP_RAW_TO_STG()` | Transformation stored procedure |
+| **Gold** | `GOLD.MEMBER_LOYALTY_SUMMARY` (view) | Active members (`IS_ACTIVE = 'Y'`) from the three country tables, with `TOTAL_REDEMPTIONS` and `TOTAL_MILES_REDEEMED` aggregated from `SILVER.MEMBER_REDEMPTIONS` |
+| **Audit** | `AUDIT.PIPELINE_AUDIT` | Pipeline stage execution tracking |
+| **Audit** | `AUDIT.TEST_AUDIT` | Regression / test run results |
+
+Every Bronze table carries `SOURCE_FILE`, `BATCH_ID` and `BIW_LOAD_DATE` (`CURRENT_TIMESTAMP()` on arrival), so each downstream row can be traced to its file and run.
+
+### Key processing rules
+
+- **Folder date check:** compare file dates in the folder against loaded batches, then process in chronological order.
+- **Data quality:** mandatory fields, key uniqueness, invalid dates (for example `2021-13-13`, bad `MMDDYYYY`, future dates), null DOB, and schema / country / JSON anomalies. Bad rows go to quarantine with a reason.
+- **Derived columns:** `AGE` (from date of birth) and `STALE_MEMBER` (more than 90 days since last flight).
+- **Latest record wins:** rank per key using `BATCH_ID` and `BIW_LOAD_DATE`.
+- **CDC Type-1 MERGE:** on a country move, the prior country row is marked `IS_ACTIVE = 'N'`.
+- **Redemptions:** JSON flattened, typed, and deduplicated on `TXN_ID`.
+
+---
+
+## Framework Diagram
 
 ```text
 +------------------------------------------------------------------------------------+
-|                           DAILY SOURCE FEEDS (<name>_<YYYYMMDD>)                    |
-|  1. Member Profile Feed (Pipe-delimited |H|/|D| - 11 cols)                         |
-|  2. Partner Airline Redemption Feed (JSON: member_id, feed_date, redemptions[])    |
+|                         DAILY SOURCE FEEDS  (<name>_<YYYYMMDD>)                     |
+|  1. Member Profile Feed       (pipe-delimited |H|/|D|, 11 columns)                  |
+|  2. Partner Redemption Feed   (JSON: member_id, feed_date, redemptions[])           |
 +-----------------------------------------+------------------------------------------+
                                           |
                                           v
 +------------------------------------------------------------------------------------+
-| FOLDER DATE CHECK & PIPELINE AUDIT TABLE (SNOWFLAKE : SKYPOINTS_WH / SKYPOINTS_DB) |
-|  - Compare folder file dates vs. loaded batches; sort chronologically and load     |
-|  - AUDIT.PIPELINE_AUDIT: tracks BATCH_ID, BIW_LOAD_DATE, stage, status (RUNNING/   |
-|    SUCCESS/FAILED), rows_read, rows_written, rows_quarantined, started_at, ended_at|
+|              FOLDER DATE CHECK  &  PIPELINE AUDIT  (SKYPOINTS_WH / SKYPOINTS_DB)    |
+|  - Compare folder file dates vs. loaded batches; sort chronologically              |
+|  - AUDIT.PIPELINE_AUDIT: BATCH_ID, BIW_LOAD_DATE, stage, status                    |
+|    (RUNNING / SUCCESS / FAILED), rows_read, rows_written, rows_quarantined,        |
+|    started_at, ended_at                                                            |
 +-----------------------------------------+------------------------------------------+
                                           |
                                           v
 +------------------------------------------------------------------------------------+
-| BRONZE / RAW LAYER (Append-only; BIW_LOAD_DATE = CURRENT_TIMESTAMP() on arrival)   |
-|  - BRONZE.RAW_MEMBER_PROFILES (11 raw cols + SOURCE_FILE + BATCH_ID + BIW_LOAD_DATE)|
-|  - BRONZE.RAW_REDEMPTION_JSON (VARIANT payload + SOURCE_FILE + BATCH_ID + BIW_LOAD_DATE)|
-+--------------------+-------------------------------------------+-------------------+
-                     |                                           |
-                     | (Chronological BATCH_ID / arrival order)  |
-                     v                                           v
-+----------------------------------------+    +--------------------------------------+
-| DATA QUALITY & BRONZE JSON PROCESSING  |    | BRONZE: FLATTENED & QUARANTINED JSON |
-| - Mandatory fields & key uniqueness    |    | - BRONZE.REDEMPTION_JSON_FLAT        |
-| - Invalid dates (2021-13-13, bad       |    |   (txn_id, member_id, feed_date_raw, |
-|   MMDDYYYY, future dates), null DOB    |    |    txn_date_raw, partner, miles_raw, |
-| - Schema / country / JSON anomalies    |    |    status, BATCH_ID, BIW_LOAD_DATE)  |
-+-------------------+--------------------+    | - BRONZE.QUARANTINE_REDEMPTION_JSON  |
-                    |                         |   (bad JSON / invalid items + reason)|
-         (Bad Rows) | (Valid Rows)            +------------------+-------------------+
-                    v                                            |
-+----------------------------------------+                       |
-| BRONZE QUARANTINE TABLE                |                       |
-| - BRONZE.QUARANTINE_MEMBER_PROFILES    |                       |
-|   (raw cols, REJECT_REASON, BATCH_ID,  |                       |
-|    BIW_LOAD_DATE)                      |                       |
-+----------------------------------------+                       |
-                    |                                            |
-                    | (Valid Rows)                               |
-                    v                                            |
-+----------------------------------------------------------------+                   |
-| SILVER: STANDARDIZED MEMBERS & REDEMPTIONS                                         |
-| - Normalize schema & parse dates/types safely                                      |
-| - Derive AGE (from DATE_OF_BIRTH) & STALE_MEMBER (>90 days since last flight)      |
-| - Rank per key ("latest record wins") + BATCH_ID + BIW_LOAD_DATE                   |
-| - CDC Type-1 MERGE; mark prior country row IS_ACTIVE='N' on country move           |
-| - SILVER.MEMBER_REDEMPTIONS: typed & deduplicated redemptions (on TXN_ID)          |
+|                     BRONZE / RAW LAYER  (append-only)                              |
+|  - BRONZE.RAW_MEMBER_PROFILES  (11 raw cols + SOURCE_FILE + BATCH_ID + BIW_LOAD_DATE)|
+|  - BRONZE.RAW_REDEMPTION_JSON  (VARIANT payload + SOURCE_FILE + BATCH_ID + ...)    |
++---------------------+--------------------------------------+-----------------------+
+                      |                                      |
+                      v                                      v
++--------------------------------------+    +----------------------------------------+
+|   DATA QUALITY  (members)            |    |   JSON PROCESSING  (redemptions)       |
+|  - Mandatory fields, key uniqueness  |    |  - BRONZE.REDEMPTION_JSON_FLAT         |
+|  - Invalid / future dates, null DOB  |    |    (txn_id, member_id, feed_date_raw,  |
+|  - Schema / country anomalies        |    |     txn_date_raw, partner, miles_raw,  |
++-------------+------------------------+    |     status, BATCH_ID, BIW_LOAD_DATE)   |
+              |                             |  - BRONZE.QUARANTINE_REDEMPTION_JSON   |
+     bad rows | valid rows                  |    (bad JSON / invalid items + reason) |
+              v                             +--------------------+-------------------+
++--------------------------------------+                         |
+|  BRONZE.QUARANTINE_MEMBER_PROFILES   |                         |
+|  (raw cols + REJECT_REASON + BATCH_ID|                         |
+|   + BIW_LOAD_DATE)                   |                         |
++--------------------------------------+                         |
+              | valid rows                                       | valid rows
+              v                                                  v
++------------------------------------------------------------------------------------+
+|                SILVER:  STANDARDIZED MEMBERS & REDEMPTIONS                         |
+|  - Normalize schema; parse dates / types safely                                    |
+|  - Derive AGE (from DATE_OF_BIRTH) and STALE_MEMBER (> 90 days since last flight)  |
+|  - Rank per key ("latest record wins") using BATCH_ID + BIW_LOAD_DATE              |
+|  - CDC Type-1 MERGE; mark prior country row IS_ACTIVE = 'N' on country move        |
+|  - SILVER.MEMBER_REDEMPTIONS: typed and deduplicated on TXN_ID                     |
 +-----------------------------------------+------------------------------------------+
                                           |
                                           v
 +------------------------------------------------------------------------------------+
-| SILVER COUNTRY TARGET TABLES (Routed by Country)                                   |
-|  - SILVER.TABLE_INDIA   |   SILVER.TABLE_USA   |   SILVER.TABLE_AUS                 |
+|                  SILVER COUNTRY TARGET TABLES  (routed by country)                 |
+|        SILVER.TABLE_INDIA   |   SILVER.TABLE_USA   |   SILVER.TABLE_AUS           |
 +-----------------------------------------+------------------------------------------+
                                           |
                                           v
 +------------------------------------------------------------------------------------+
-| GOLD LAYER & STREAMLIT DEMO                                                        |
-|  - GOLD.MEMBER_LOYALTY_SUMMARY: joins country member profiles + MEMBER_REDEMPTIONS |
-|  - Metrics: AGE, STALE_MEMBER, IS_ACTIVE, TOTAL_REDEMPTIONS, TOTAL_MILES_REDEEMED |
-|  - Streamlit dashboard for interactive live demo walkthrough                      |
+|                         GOLD LAYER  &  STREAMLIT DEMO                              |
+|  - GOLD.MEMBER_LOYALTY_SUMMARY: country member profiles + MEMBER_REDEMPTIONS       |
+|  - Metrics: AGE, STALE_MEMBER, IS_ACTIVE, TOTAL_REDEMPTIONS, TOTAL_MILES_REDEEMED  |
+|  - Streamlit dashboard for the interactive live demo                               |
 +------------------------------------------------------------------------------------+
+```
+
+---
+
+## Project Structure
+
+```text
+Incubyte_assessment/
+├── data/                          # Generated mock feed files
+├── logs/                          
+├── sql/
+│   ├── ddl_tables.sql             # Warehouse, schemas, tables, view, and audit DDL
+│   └── sp_raw_to_stg.sql          # SILVER.SP_RAW_TO_STG() transformation procedure
+├── src/
+│   ├── generate_mock_data.py      # Generates pipe-delimited member CSVs and JSON redemption feeds
+│   ├── ingest_to_bronze.py        # Bronze ingestion logic
+│   ├── regression_test.py         # Read-only Bronze/Silver/Gold/Audit checks, writes to AUDIT.TEST_AUDIT
+│   ├── run_pipeline.py            # Generates mock files, ingests to BRONZE, runs SILVER.SP_RAW_TO_STG()
+│   └── streamlit_app.py           # Streamlit dashboard querying GOLD.MEMBER_LOYALTY_SUMMARY
+├── tests/                        
+├── .env                           # Local Snowflake credentials (not committed)
+├── .env.example                   # Template for required environment variables
+├── .gitignore
+└── README.md
+```
+
+### Run order at a glance
+
+```text
+generate_mock_data.py  ->  ingest_to_bronze.py  ->  SILVER.SP_RAW_TO_STG()  ->  regression_test.py  ->  streamlit_app.py
+        (run_pipeline.py chains the first three steps)
+```
+
+---
+
+## Setup & Run
+
+> Commands assume the file names in the structure above. Adjust if your entry points take arguments.
+
+```bash
+# 1. Configure Snowflake credentials
+cp .env.example .env              # then fill in your account, user, password, role
+
+# 2. Create warehouse, schemas, tables, view and audit tables
+#    Run sql/ddl_tables.sql and sql/sp_raw_to_stg.sql in a Snowflake worksheet (or via SnowSQL)
+
+# 3. Run the pipeline: generate mock files, ingest to Bronze, run the Silver transformation
+python src/run_pipeline.py
+
+# 4. Run the regression checks (results are written to AUDIT.TEST_AUDIT)
+python src/regression_test.py
+
+# 5. Launch the dashboard
+streamlit run src/streamlit_app.py
+```
+
+---
+
+## Deliverables Map
+
+| # | Deliverable | Where it lives |
+|---|-------------|----------------|
+| 1 | DDL for raw, staging and country target tables | `sql/ddl_tables.sql` |
+| 2 | Staging load with derived `AGE` and `STALE_MEMBER` | `sql/sp_raw_to_stg.sql` |
+| 3 | Country split with "latest record wins" | `sql/sp_raw_to_stg.sql` |
+| 4 | JSON flattening and join to members | `sql/sp_raw_to_stg.sql`, `GOLD.MEMBER_LOYALTY_SUMMARY` |
+| 5 | Validations and quarantine | `sql/sp_raw_to_stg.sql`, `src/regression_test.py` |
+| 6 | Live demo | `src/streamlit_app.py` |
