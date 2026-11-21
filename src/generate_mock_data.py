@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -11,7 +13,10 @@ from dotenv import load_dotenv
 VALID_LOCATIONS = [
     ("IND", "TN", ["600001", "641601", "620001", "625001"]),
     ("AUS", "NSW", ["2000", "2010", "2150", "2300"]),
+    ("AU", "VIC", ["3000", "3004", "3121", "3141"]),
     ("USA", "CA", ["90001", "94105", "92101", "95112"]),
+    ("PHIL", "NCR", ["1000", "1100", "1200", "1630"]),
+    ("CAN", "ONT", ["M5V2T", "K1A0B", "L5B3C", "N2L3G"]),
 ]
 
 FIRST_NAMES = [
@@ -71,6 +76,7 @@ def build_member_line(
     base_id: int = 223457,
     stale_ratio: float = 0.25,
     force_bad: str | None = None,
+    override_country: tuple[str, str, str] | None = None,
 ) -> str:
     member_id = make_member_id(idx, base_id=base_id)
     first_name = random.choice(FIRST_NAMES)
@@ -81,8 +87,12 @@ def build_member_line(
     last_flight_dt = pick_last_flight_date(today, stale_ratio=stale_ratio)
     dob_dt = random_date(1965, 2002)
 
-    country, state, post_codes = random.choice(VALID_LOCATIONS)
-    post_code = random.choice(post_codes)
+    if override_country:
+        country, state, post_code = override_country
+    else:
+        country, state, post_codes = random.choice(VALID_LOCATIONS)
+        post_code = random.choice(post_codes)
+
     tier_code = random.choice(TIERS)
     agent_name = random.choice(AGENTS)
     is_active = random.choice(["A", "A", "A", "I"])
@@ -91,16 +101,12 @@ def build_member_line(
     last_flight_str = format_date_field(last_flight_dt, "yyyymmdd")
     dob_str = format_date_field(dob_dt, "mmddyyyy")
 
-    if force_bad == "bad_country_phil":
-        country, state, post_code = "PHIL", "NCR", "1000"
-    elif force_bad == "bad_country_can":
-        country, state, post_code = "CAN", "ONT", "M5V2T6"
+    if force_bad == "bad_country_unknown":
+        country, state, post_code = "XYZ", "NA", "00000"
     elif force_bad == "missing_name":
         member_name = ""
     elif force_bad == "missing_id":
         member_id = ""
-    elif force_bad == "short_id":
-        member_id = str(idx)
     elif force_bad == "non_numeric_id":
         member_id = f"BAD-{idx}"
     elif force_bad == "duplicate_id":
@@ -109,6 +115,22 @@ def build_member_line(
         enroll_str = "2021-13-13"
     elif force_bad == "future_date":
         last_flight_str = (today + timedelta(days=30)).strftime("%Y%m%d")
+    elif force_bad == "malformed_pipe":
+        # Mirrors the PDF sample anomaly "|D|Ravi 223458|..." (missing pipe delimiter)
+        fields = [
+            "D",
+            f"{member_name} {member_id}",
+            enroll_str,
+            last_flight_str,
+            tier_code,
+            agent_name,
+            state,
+            country,
+            post_code,
+            dob_str,
+            is_active,
+        ]
+        return "|" + "|".join(fields)
 
     fields = [
         "D",
@@ -186,6 +208,7 @@ def generate_mock_files(
     run_date: date | None = None,
     base_id: int = 223457,
     stale_ratio: float = 0.25,
+    first_member_country: tuple[str, str, str] | None = None,
 ) -> tuple[Path, Path]:
     flat_dir.mkdir(parents=True, exist_ok=True)
     json_dir.mkdir(parents=True, exist_ok=True)
@@ -197,15 +220,14 @@ def generate_mock_files(
     json_path = json_dir / f"redemption_feed{date_str}.json"
 
     bad_modes_flat = [
-        "bad_country_phil",
-        "bad_country_can",
+        "bad_country_unknown",
         "missing_name",
         "missing_id",
-        "short_id",
         "non_numeric_id",
         "duplicate_id",
         "bad_date",
         "future_date",
+        "malformed_pipe",
     ]
     bad_modes_json = [
         "bad_miles",
@@ -230,6 +252,7 @@ def generate_mock_files(
         f_flat.write(CSV_HEADER + "\n")
         for idx in range(1, count + 1):
             bad_mode = random.choice(bad_modes_flat) if idx in bad_indices_flat else None
+            override = first_member_country if idx == 1 else None
             f_flat.write(
                 build_member_line(
                     idx,
@@ -237,6 +260,7 @@ def generate_mock_files(
                     base_id=base_id,
                     stale_ratio=stale_ratio,
                     force_bad=bad_mode,
+                    override_country=override,
                 )
                 + "\n"
             )
@@ -298,20 +322,48 @@ def main() -> None:
         default=None,
         help="Optional date in YYYYMMDD format (defaults to today's date).",
     )
+    parser.add_argument(
+        "--country-move-demo",
+        action="store_true",
+        help="Generate two consecutive days where member 223457 moves from USA (Day 1) to IND (Day 2).",
+    )
     args = parser.parse_args()
 
     parsed_date = datetime.strptime(args.date, "%Y%m%d").date() if args.date else date.today()
-    flat_file, json_file = generate_mock_files(
-        flat_dir=args.flat_dir,
-        json_dir=args.json_dir,
-        count=args.count,
-        run_date=parsed_date,
-        base_id=args.base_id,
-        stale_ratio=args.stale_ratio,
-    )
-    print(f"Flat CSV dumped ({args.count} records) -> {flat_file}")
-    print(f"JSON file dumped ({args.count} records) -> {json_file}")
+    if args.country_move_demo:
+        day1 = parsed_date - timedelta(days=1)
+        f1, j1 = generate_mock_files(
+            flat_dir=args.flat_dir,
+            json_dir=args.json_dir,
+            count=args.count,
+            run_date=day1,
+            base_id=args.base_id,
+            stale_ratio=args.stale_ratio,
+            first_member_country=("USA", "CA", "94105"),
+        )
+        f2, j2 = generate_mock_files(
+            flat_dir=args.flat_dir,
+            json_dir=args.json_dir,
+            count=args.count,
+            run_date=parsed_date,
+            base_id=args.base_id,
+            stale_ratio=args.stale_ratio,
+            first_member_country=("IND", "TN", "600001"),
+        )
+        print(f"Day 1 (USA -> member {args.base_id}): {f1}, {j1}")
+        print(f"Day 2 (IND -> member {args.base_id}): {f2}, {j2}")
+    else:
+        flat_file, json_file = generate_mock_files(
+            flat_dir=args.flat_dir,
+            json_dir=args.json_dir,
+            count=args.count,
+            run_date=parsed_date,
+            base_id=args.base_id,
+            stale_ratio=args.stale_ratio,
+        )
+        print(f"Flat CSV dumped ({args.count} records) -> {flat_file}")
+        print(f"JSON file dumped ({args.count} records) -> {json_file}")
 
 
 if __name__ == "__main__":
-    main() 
+    main()
