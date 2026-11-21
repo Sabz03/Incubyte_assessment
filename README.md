@@ -153,7 +153,7 @@ Incubyte_assessment/
 
 ```text
 generate_mock_data.py  ->  ingest_to_bronze.py  ->  SILVER.SP_RAW_TO_STG()  ->  regression_test.py  ->  streamlit_app.py
-        (run_pipeline.py chains the first three steps)
+        (run_pipeline.py chains the first four steps)
 ```
 
 ---
