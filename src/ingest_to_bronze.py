@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -48,6 +49,58 @@ def get_snowflake_connection() -> snowflake.connector.SnowflakeConnection:
 
 def make_pipeline_run_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def feed_date_from_filename(file_path: Path) -> date:
+    match = re.search(r"(\d{8})$", file_path.stem)
+    if not match:
+        raise ValueError(
+            f"Feed filename must end with a YYYYMMDD date before its extension: {file_path.name}"
+        )
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"Invalid YYYYMMDD date in feed filename: {file_path.name}") from exc
+
+
+def sort_feed_files(file_paths: list[Path]) -> list[Path]:
+    return sorted(file_paths, key=lambda path: (feed_date_from_filename(path), path.name.lower()))
+
+
+def unprocessed_feed_files(file_paths: list[Path], loaded_files: set[str]) -> list[Path]:
+    return [path for path in file_paths if path.name not in loaded_files]
+
+
+def loaded_source_files(conn: Any) -> tuple[set[str], set[str]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT SOURCE_FILE
+            FROM (
+                SELECT SOURCE_FILE FROM BRONZE.RAW_MEMBER_PROFILES
+                UNION ALL
+                SELECT SOURCE_FILE FROM BRONZE.QUARANTINE_MEMBER_PROFILES
+            )
+            WHERE SOURCE_FILE IS NOT NULL
+            """
+        )
+        member_files = {row[0] for row in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT DISTINCT SOURCE_FILE
+            FROM (
+                SELECT SOURCE_FILE FROM BRONZE.RAW_REDEMPTION_JSON
+                UNION ALL
+                SELECT SOURCE_FILE FROM BRONZE.REDEMPTION_JSON_FLAT
+                UNION ALL
+                SELECT SOURCE_FILE FROM BRONZE.QUARANTINE_REDEMPTION_JSON
+            )
+            WHERE SOURCE_FILE IS NOT NULL
+            """
+        )
+        redemption_files = {row[0] for row in cur.fetchall()}
+    return member_files, redemption_files
 
 
 def normalize_and_parse_date(raw_val: str | None) -> tuple[date | None, str | None]:
@@ -586,15 +639,21 @@ def ingest_json_files(conn: Any, json_files: list[Path], pipeline_run_id: str) -
 def run_bronze_ingestion(flat_dir: Path, json_dir: Path) -> None:
     pipeline_run_id = make_pipeline_run_id()
     member_files = (
-        sorted([p for p in flat_dir.iterdir() if p.is_file() and p.suffix.lower() in {".csv", ".txt", ".dat", ".psv"}])
+        [
+            p
+            for p in flat_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".csv", ".txt", ".dat", ".psv"}
+        ]
         if flat_dir.exists()
         else []
     )
     json_files = (
-        sorted([p for p in json_dir.iterdir() if p.is_file() and p.suffix.lower() == ".json"])
+        [p for p in json_dir.iterdir() if p.is_file() and p.suffix.lower() == ".json"]
         if json_dir.exists()
         else []
     )
+    member_files = sort_feed_files(member_files)
+    json_files = sort_feed_files(json_files)
 
     print(f"[{pipeline_run_id}] Connecting to Snowflake...")
     conn = get_snowflake_connection()
@@ -603,11 +662,21 @@ def run_bronze_ingestion(flat_dir: Path, json_dir: Path) -> None:
             insert_audit_start(cur, pipeline_run_id, "BRONZE_INGEST")
         conn.commit()
 
-        print(f"[{pipeline_run_id}] Processing {len(member_files)} member file(s)...")
-        m_read, m_valid, m_quar = ingest_member_files(conn, member_files, pipeline_run_id)
+        loaded_members, loaded_redemptions = loaded_source_files(conn)
+        pending_member_files = unprocessed_feed_files(member_files, loaded_members)
+        pending_json_files = unprocessed_feed_files(json_files, loaded_redemptions)
+        skipped_members = len(member_files) - len(pending_member_files)
+        skipped_json = len(json_files) - len(pending_json_files)
 
-        print(f"[{pipeline_run_id}] Processing {len(json_files)} JSON file(s)...")
-        j_read, j_flat, j_quar = ingest_json_files(conn, json_files, pipeline_run_id)
+        print(
+            f"[{pipeline_run_id}] Skipping already loaded files: "
+            f"{skipped_members} member, {skipped_json} redemption."
+        )
+        print(f"[{pipeline_run_id}] Processing {len(pending_member_files)} member file(s)...")
+        m_read, m_valid, m_quar = ingest_member_files(conn, pending_member_files, pipeline_run_id)
+
+        print(f"[{pipeline_run_id}] Processing {len(pending_json_files)} JSON file(s)...")
+        j_read, j_flat, j_quar = ingest_json_files(conn, pending_json_files, pipeline_run_id)
 
         total_read = m_read + j_read
         total_written = m_valid + j_flat

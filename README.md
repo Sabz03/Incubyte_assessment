@@ -19,7 +19,7 @@ End-to-end Snowflake data warehouse pipeline for the **SkyPoints** airline loyal
 
 ## Overview
 
-Every day the source system delivers two feeds, named `<name>_<YYYYMMDD>`:
+Every day the source system delivers two feeds with a `YYYYMMDD` date at the end of the filename stem (for example, `member_profiles20261121.csv` or `member_profiles_20261121.csv`):
 
 | Feed | Format | Contents |
 |------|--------|----------|
@@ -50,7 +50,7 @@ Every Bronze table carries `SOURCE_FILE`, `BATCH_ID` and `BIW_LOAD_DATE` (`CURRE
 
 ### Key processing rules
 
-- **Folder date check:** compare file dates in the folder against loaded batches, then process in chronological order.
+- **Folder date check:** validate each filename's trailing `YYYYMMDD`, skip files already recorded by `SOURCE_FILE` in the corresponding Bronze raw/flat/quarantine tables, and process new files chronologically within each feed. Feed filenames should be immutable after ingestion; use a new filename when delivering replacement data.
 - **Data quality:** mandatory fields, key uniqueness, invalid dates (for example `2021-13-13`, bad `MMDDYYYY`, future dates), null DOB, and schema / country / JSON anomalies. Bad rows go to quarantine with a reason.
 - **Derived columns:** `AGE` (from date of birth) and `STALE_MEMBER` (more than 90 days since last flight).
 - **Latest record wins:** rank per key using `BATCH_ID` and `BIW_LOAD_DATE`.
@@ -63,7 +63,7 @@ Every Bronze table carries `SOURCE_FILE`, `BATCH_ID` and `BIW_LOAD_DATE` (`CURRE
 
 ```text
 +------------------------------------------------------------------------------------+
-|                         DAILY SOURCE FEEDS  (<name>_<YYYYMMDD>)                     |
+|                    DAILY SOURCE FEEDS (filename ends in YYYYMMDD)                   |
 |  1. Member Profile Feed       (pipe-delimited |H|/|D|, 11 columns)                  |
 |  2. Partner Redemption Feed   (JSON: member_id, feed_date, redemptions[])           |
 +-----------------------------------------+------------------------------------------+
@@ -71,7 +71,7 @@ Every Bronze table carries `SOURCE_FILE`, `BATCH_ID` and `BIW_LOAD_DATE` (`CURRE
                                           v
 +------------------------------------------------------------------------------------+
 |              FOLDER DATE CHECK  &  PIPELINE AUDIT  (SKYPOINTS_WH / SKYPOINTS_DB)    |
-|  - Compare folder file dates vs. loaded batches; sort chronologically              |
+|  - Validate feed dates, skip loaded SOURCE_FILEs, sort pending files chronologically|
 |  - AUDIT.PIPELINE_AUDIT: BATCH_ID, BIW_LOAD_DATE, stage, status                    |
 |    (RUNNING / SUCCESS / FAILED), rows_read, rows_written, rows_quarantined,        |
 |    started_at, ended_at                                                            |
@@ -139,10 +139,11 @@ Incubyte_assessment/
 ├── src/
 │   ├── generate_mock_data.py      # Generates pipe-delimited member CSVs and JSON redemption feeds
 │   ├── ingest_to_bronze.py        # Bronze ingestion logic
-│   ├── run_pipeline.py            # Generates mock files, ingests to BRONZE, runs SILVER.SP_RAW_TO_STG()
+│   ├── run_pipeline.py            # Generates mock files, ingests to BRONZE, transforms Silver, runs checks
 │   └── streamlit_app.py           # Streamlit dashboard querying GOLD.MEMBER_LOYALTY_SUMMARY
-├── tests/ 
-|     └── regression_test.py         # Read-only Bronze/Silver/Gold/Audit checks, writes to audit tables                     
+├── tests/
+│   ├── regression_test.py         # Bronze/Silver/Gold/Audit checks; writes results to AUDIT.TEST_AUDIT
+│   └── test_feed_file_selection.py # Unit tests for filename dates, ordering, and skipping loaded files
 ├── .env                           # Local Snowflake credentials (not committed)
 ├── .env.example                   # Template for required environment variables
 ├── .gitignore
@@ -153,7 +154,7 @@ Incubyte_assessment/
 
 ```text
 generate_mock_data.py  ->  ingest_to_bronze.py  ->  SILVER.SP_RAW_TO_STG()  ->  regression_test.py  ->  streamlit_app.py
-        (run_pipeline.py chains the first three steps)
+        (run_pipeline.py chains the first four steps)
 ```
 
 ---
@@ -168,16 +169,23 @@ cp .env.example .env              # then fill in your account, user, password, r
 
 # 2. Create warehouse, schemas, tables, view and audit tables
 #    Run sql/ddl_tables.sql and sql/sp_raw_to_stg.sql in a Snowflake worksheet (or via SnowSQL)
+#    ddl_tables.sql uses IF NOT EXISTS, so rerunning it preserves existing tables.
+#    It will not apply schema changes to tables/views that already exist.
 
-# 3. Run the pipeline: generate mock files, ingest to Bronze, run the Silver transformation
+# 3. Run the pipeline: generate files, ingest Bronze, transform Silver, and run regression checks
 python src/run_pipeline.py
 
-# 4. Run the regression checks (results are written to AUDIT.TEST_AUDIT)
-python src/regression_test.py
+# 4. Run the focused local unit tests
+python -m unittest discover -s tests -p "test_*.py"
 
-# 5. Launch the dashboard
-streamlit run src/streamlit_app.py
+# Optional: rerun only the Snowflake regression checks (results go to AUDIT.TEST_AUDIT)
+python tests/regression_test.py
+
+# 5. Deploy src/streamlit_app.py as a Streamlit in Snowflake app.
+#    It uses get_active_session() and is not intended for ordinary local `streamlit run`.
 ```
+
+The focused unit tests check supported filename date formats, reject missing or invalid dates, and verify chronological ordering and skipping previously loaded files. They run locally without Snowflake. The separate `regression_test.py` checks live warehouse tables and requires Snowflake credentials.
 
 ---
 
