@@ -1,15 +1,20 @@
+from __future__ import annotations
+
 import argparse
+import csv
+import gzip
 import json
 import os
 import re
 import sys
+import tempfile
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import snowflake.connector
 from dotenv import load_dotenv
-
 
 MEMBER_COLUMNS = [
     "MEMBER_NAME",
@@ -25,8 +30,40 @@ MEMBER_COLUMNS = [
     "IS_ACTIVE",
 ]
 
+RAW_MEMBER_COLUMNS = [
+    "MEMBER_NAME",
+    "MEMBER_ID",
+    "ENROLLMENT_DATE",
+    "LAST_FLIGHT_DATE",
+    "TIER_CODE",
+    "AGENT_NAME",
+    "STATE",
+    "COUNTRY",
+    "POST_CODE",
+    "DATE_OF_BIRTH",
+    "ACTIVE_MEMBER",
+    "SOURCE_FILE",
+    "BATCH_ID",
+]
+
+QUARANTINE_MEMBER_COLUMNS = [
+    "MEMBER_NAME",
+    "MEMBER_ID",
+    "ENROLLMENT_DATE",
+    "LAST_FLIGHT_DATE",
+    "TIER_CODE",
+    "AGENT_NAME",
+    "STATE",
+    "COUNTRY",
+    "POST_CODE",
+    "DATE_OF_BIRTH",
+    "ACTIVE_MEMBER",
+    "REJECT_REASON",
+    "SOURCE_FILE",
+    "BATCH_ID",
+]
+
 VALID_COUNTRIES = {"IND", "AUS", "USA"}
-CHUNK_SIZE = 1000
 
 
 def get_snowflake_connection() -> snowflake.connector.SnowflakeConnection:
@@ -221,186 +258,325 @@ def validate_member_row(row_dict: dict[str, str], seen_ids_in_batch: set[str]) -
     return "; ".join(reasons) if reasons else None
 
 
-def bulk_insert_variant_rows(
+def _put_and_copy_csv(
     cur: Any,
-    table_name: str,
+    stage: str,
+    file_format: str,
+    target_table: str,
     columns: list[str],
-    rows: list[tuple],
-    variant_col_index: int = 0,
+    local_gz: Path,
+    subpath_prefix: str,
 ) -> None:
-    if not rows:
-        return
-
-    payload_items: list[dict[str, Any]] = []
-    for r in rows:
-        item: dict[str, Any] = {}
-        for idx, col_name in enumerate(columns):
-            val = r[idx]
-            if idx == variant_col_index and isinstance(val, str):
-                try:
-                    val = json.loads(val)
-                except json.JSONDecodeError:
-                    pass
-            item[col_name.lower()] = val
-        payload_items.append(item)
-
-    select_cols: list[str] = []
-    for col_name in columns:
-        key = col_name.lower()
-        if col_name.upper() == columns[variant_col_index].upper():
-            select_cols.append(f"f.value:{key}")
-        else:
-            select_cols.append(f"f.value:{key}::VARCHAR")
-    select_cols.append("CURRENT_TIMESTAMP()")
-
-    col_list = ", ".join(columns)
-    for start in range(0, len(payload_items), CHUNK_SIZE):
-        chunk = payload_items[start : start + CHUNK_SIZE]
-        sql = (
-            f"INSERT INTO {table_name} ({col_list}, BIW_LOAD_DATE) "
-            f"SELECT {', '.join(select_cols)} "
-            f"FROM LATERAL FLATTEN(input => PARSE_JSON(%s)) f"
-        )
-        cur.execute(sql, (json.dumps(chunk),))
-
-
-def insert_audit_start(cur: Any, pipeline_run_id: str, stage: str) -> None:
+    stage_subpath = f"{stage}/{subpath_prefix}"
     cur.execute(
-        """
-        INSERT INTO AUDIT.PIPELINE_AUDIT (
-            PIPELINE_RUN_ID, STAGE, STATUS, ROWS_READ, ROWS_WRITTEN, ROWS_QUARANTINED,
-            ERROR_MESSAGE, STARTED_AT, BIW_LOAD_DATE
+        f"PUT 'file://{local_gz.as_posix()}' {stage_subpath} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+    )
+    col_list = ", ".join(columns)
+    select_list = ", ".join(f"${idx}" for idx in range(1, len(columns) + 1))
+    cur.execute(
+        f"""
+        COPY INTO {target_table} ({col_list}, BIW_LOAD_DATE)
+        FROM (
+            SELECT {select_list}, CURRENT_TIMESTAMP()
+            FROM {stage_subpath}/{local_gz.name}
         )
-        VALUES (%s, %s, 'RUNNING', 0, 0, 0, NULL, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
-        """,
-        (pipeline_run_id, stage),
+        FILE_FORMAT = (FORMAT_NAME = {file_format})
+        PURGE = TRUE
+        """
     )
 
 
-def insert_audit_finish(
+def _put_and_copy_raw_json(
     cur: Any,
+    stage: str,
+    file_format: str,
+    payload_rows: list[tuple[str, str, str]],
+    subpath_prefix: str,
+) -> None:
+    """Stages NDJSON rows and COPYs raw JSON payloads into BRONZE.RAW_REDEMPTION_JSON."""
+    if not payload_rows:
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        local_gz = Path(tmp_dir) / f"raw_json_{uuid.uuid4().hex[:8]}.ndjson.gz"
+        with gzip.open(local_gz, "wt", encoding="utf-8") as gz_f:
+            for payload_str, source_file, batch_id in payload_rows:
+                envelope = {
+                    "payload": json.loads(payload_str),
+                    "source_file": source_file,
+                    "batch_id": batch_id,
+                }
+                gz_f.write(json.dumps(envelope) + "\n")
+
+        stage_subpath = f"{stage}/{subpath_prefix}"
+        cur.execute(
+            f"PUT 'file://{local_gz.as_posix()}' {stage_subpath} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+        )
+        cur.execute(
+            f"""
+            COPY INTO BRONZE.RAW_REDEMPTION_JSON (
+                PAYLOAD, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
+            )
+            FROM (
+                SELECT
+                    $1:payload,
+                    $1:source_file::VARCHAR,
+                    $1:batch_id::VARCHAR,
+                    CURRENT_TIMESTAMP()
+                FROM {stage_subpath}/{local_gz.name}
+            )
+            FILE_FORMAT = (FORMAT_NAME = {file_format})
+            PURGE = TRUE
+            """
+        )
+
+
+def _put_and_copy_quarantine_json(
+    cur: Any,
+    stage: str,
+    file_format: str,
+    quar_rows: list[tuple],
+    subpath_prefix: str,
+) -> None:
+    """Stages NDJSON rows and COPYs into BRONZE.QUARANTINE_REDEMPTION_JSON."""
+    if not quar_rows:
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        local_gz = Path(tmp_dir) / f"quar_json_{uuid.uuid4().hex[:8]}.ndjson.gz"
+        with gzip.open(local_gz, "wt", encoding="utf-8") as gz_f:
+            for r in quar_rows:
+                (
+                    raw_json_str,
+                    member_id,
+                    feed_date_raw,
+                    txn_id,
+                    txn_date_raw,
+                    partner,
+                    miles_raw_str,
+                    status,
+                    reject_reason,
+                    source_file,
+                    batch_id,
+                ) = r
+                try:
+                    payload_obj: Any = json.loads(raw_json_str)
+                except json.JSONDecodeError:
+                    payload_obj = {"raw_text": raw_json_str}
+                doc = {
+                    "raw_payload": payload_obj,
+                    "member_id": member_id,
+                    "feed_date_raw": feed_date_raw,
+                    "txn_id": txn_id,
+                    "txn_date_raw": txn_date_raw,
+                    "partner": partner,
+                    "miles_raw": miles_raw_str,
+                    "status": status,
+                    "reject_reason": reject_reason,
+                    "source_file": source_file,
+                    "batch_id": batch_id,
+                }
+                gz_f.write(json.dumps(doc) + "\n")
+
+        stage_subpath = f"{stage}/{subpath_prefix}"
+        cur.execute(
+            f"PUT 'file://{local_gz.as_posix()}' {stage_subpath} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+        )
+        cur.execute(
+            f"""
+            COPY INTO BRONZE.QUARANTINE_REDEMPTION_JSON (
+                RAW_PAYLOAD, MEMBER_ID, FEED_DATE_RAW, TXN_ID, TXN_DATE_RAW,
+                PARTNER, MILES_RAW, STATUS, REJECT_REASON, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
+            )
+            FROM (
+                SELECT
+                    $1:raw_payload,
+                    $1:member_id::VARCHAR,
+                    $1:feed_date_raw::VARCHAR,
+                    $1:txn_id::VARCHAR,
+                    $1:txn_date_raw::VARCHAR,
+                    $1:partner::VARCHAR,
+                    $1:miles_raw::VARCHAR,
+                    $1:status::VARCHAR,
+                    $1:reject_reason::VARCHAR,
+                    $1:source_file::VARCHAR,
+                    $1:batch_id::VARCHAR,
+                    CURRENT_TIMESTAMP()
+                FROM {stage_subpath}/{local_gz.name}
+            )
+            FILE_FORMAT = (FORMAT_NAME = {file_format})
+            PURGE = TRUE
+            """
+        )
+
+
+def _flatten_raw_json_to_flat(cur: Any, pipeline_run_id: str) -> int:
+    """Flattens newly loaded BRONZE.RAW_REDEMPTION_JSON rows for pipeline_run_id into BRONZE.REDEMPTION_JSON_FLAT."""
+    cur.execute(
+        """
+        INSERT INTO BRONZE.REDEMPTION_JSON_FLAT (
+            TXN_ID, MEMBER_ID, FEED_DATE_RAW, TXN_DATE_RAW,
+            PARTNER, MILES_RAW, STATUS, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
+        )
+        SELECT
+            NULLIF(TRIM(f.value:txn_id::VARCHAR), '')         AS TXN_ID,
+            NULLIF(TRIM(r.PAYLOAD:member_id::VARCHAR), '')    AS MEMBER_ID,
+            NULLIF(TRIM(r.PAYLOAD:feed_date::VARCHAR), '')    AS FEED_DATE_RAW,
+            NULLIF(TRIM(f.value:txn_date::VARCHAR), '')       AS TXN_DATE_RAW,
+            NULLIF(TRIM(f.value:partner::VARCHAR), '')        AS PARTNER,
+            NULLIF(TRIM(f.value:miles_redeemed::VARCHAR), '') AS MILES_RAW,
+            NULLIF(UPPER(TRIM(f.value:status::VARCHAR)), '')  AS STATUS,
+            r.SOURCE_FILE,
+            r.BATCH_ID,
+            CURRENT_TIMESTAMP()
+        FROM BRONZE.RAW_REDEMPTION_JSON r,
+             LATERAL FLATTEN(input => r.PAYLOAD:redemptions) f
+        WHERE r.BATCH_ID = %s
+        """,
+        (pipeline_run_id,),
+    )
+    return cur.rowcount or 0
+
+
+def write_audit_entry(
+    conn: Any,
     pipeline_run_id: str,
     stage: str,
     status: str,
     rows_read: int,
     rows_written: int,
     rows_quarantined: int,
+    started_at: datetime,
     error_message: str | None = None,
 ) -> None:
-    cur.execute(
-        """
-        INSERT INTO AUDIT.PIPELINE_AUDIT (
-            PIPELINE_RUN_ID, STAGE, STATUS, ROWS_READ, ROWS_WRITTEN, ROWS_QUARANTINED,
-            ERROR_MESSAGE, STARTED_AT, ENDED_AT, BIW_LOAD_DATE
+    """Writes a single audit record per pipeline run."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO AUDIT.PIPELINE_AUDIT (
+                PIPELINE_RUN_ID, STAGE, STATUS, ROWS_READ, ROWS_WRITTEN, ROWS_QUARANTINED,
+                ERROR_MESSAGE, STARTED_AT, ENDED_AT, BIW_LOAD_DATE
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+            """,
+            (
+                pipeline_run_id,
+                stage,
+                status,
+                rows_read,
+                rows_written,
+                rows_quarantined,
+                error_message[:3900] if error_message else None,
+                started_at,
+            ),
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
-        """,
-        (
-            pipeline_run_id,
-            stage,
-            status,
-            rows_read,
-            rows_written,
-            rows_quarantined,
-            error_message[:3900] if error_message else None,
-        ),
-    )
+    conn.commit()
 
 
 def ingest_member_files(conn: Any, member_files: list[Path], pipeline_run_id: str) -> tuple[int, int, int]:
+    if not member_files:
+        return 0, 0, 0
+
     rows_read = 0
     rows_valid = 0
     rows_quarantined = 0
     seen_ids: set[str] = set()
 
-    valid_raw_rows: list[tuple] = []
-    quarantine_rows: list[tuple] = []
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        valid_gz = Path(tmp_dir) / f"valid_members_{uuid.uuid4().hex[:8]}.csv.gz"
+        quar_gz = Path(tmp_dir) / f"quar_members_{uuid.uuid4().hex[:8]}.csv.gz"
 
-    for fp in member_files:
-        records = parse_member_file(fp)
-        for rec in records:
-            rows_read += 1
-            country_norm = (rec["COUNTRY"] or "").strip().upper()
-            tier_norm = (rec["TIER_CODE"] or "").strip().upper()
+        with (
+            gzip.open(valid_gz, "wt", encoding="utf-8", newline="") as f_valid,
+            gzip.open(quar_gz, "wt", encoding="utf-8", newline="") as f_quar,
+        ):
+            w_valid = csv.writer(f_valid)
+            w_quar = csv.writer(f_quar)
+            w_valid.writerow(RAW_MEMBER_COLUMNS)
+            w_quar.writerow(QUARANTINE_MEMBER_COLUMNS)
 
-            reject_reason = validate_member_row(rec, seen_ids)
-            if reject_reason:
-                rows_quarantined += 1
-                quarantine_rows.append(
-                    (
-                        rec["MEMBER_NAME"],
-                        rec["MEMBER_ID"],
-                        rec["ENROLLMENT_DATE"],
-                        rec["LAST_FLIGHT_DATE"],
-                        tier_norm,
-                        rec["AGENT_NAME"],
-                        rec["STATE"],
-                        country_norm,
-                        rec["POST_CODE"],
-                        rec["DOB"],
-                        rec["IS_ACTIVE"],
-                        reject_reason,
-                        fp.name,
-                        pipeline_run_id,
-                    )
-                )
-            else:
-                rows_valid += 1
-                valid_raw_rows.append(
-                    (
-                        rec["MEMBER_NAME"],
-                        rec["MEMBER_ID"],
-                        rec["ENROLLMENT_DATE"],
-                        rec["LAST_FLIGHT_DATE"],
-                        tier_norm,
-                        rec["AGENT_NAME"],
-                        rec["STATE"],
-                        country_norm,
-                        rec["POST_CODE"],
-                        rec["DOB"],
-                        rec["IS_ACTIVE"],
-                        fp.name,
-                        pipeline_run_id,
-                    )
-                )
+            for fp in member_files:
+                records = parse_member_file(fp)
+                for rec in records:
+                    rows_read += 1
+                    country_norm = (rec["COUNTRY"] or "").strip().upper()
+                    tier_norm = (rec["TIER_CODE"] or "").strip().upper()
 
-    with conn.cursor() as cur:
-        for i in range(0, len(valid_raw_rows), CHUNK_SIZE):
-            cur.executemany(
-                """
-                INSERT INTO BRONZE.RAW_MEMBER_PROFILES (
-                    MEMBER_NAME, MEMBER_ID, ENROLLMENT_DATE, LAST_FLIGHT_DATE,
-                    TIER_CODE, AGENT_NAME, STATE, COUNTRY, POST_CODE, DATE_OF_BIRTH,
-                    ACTIVE_MEMBER, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-                """,
-                valid_raw_rows[i : i + CHUNK_SIZE],
-            )
+                    reject_reason = validate_member_row(rec, seen_ids)
+                    if reject_reason:
+                        rows_quarantined += 1
+                        w_quar.writerow(
+                            [
+                                rec["MEMBER_NAME"],
+                                rec["MEMBER_ID"],
+                                rec["ENROLLMENT_DATE"],
+                                rec["LAST_FLIGHT_DATE"],
+                                tier_norm,
+                                rec["AGENT_NAME"],
+                                rec["STATE"],
+                                country_norm,
+                                rec["POST_CODE"],
+                                rec["DOB"],
+                                rec["IS_ACTIVE"],
+                                reject_reason,
+                                fp.name,
+                                pipeline_run_id,
+                            ]
+                        )
+                    else:
+                        rows_valid += 1
+                        w_valid.writerow(
+                            [
+                                rec["MEMBER_NAME"],
+                                rec["MEMBER_ID"],
+                                rec["ENROLLMENT_DATE"],
+                                rec["LAST_FLIGHT_DATE"],
+                                tier_norm,
+                                rec["AGENT_NAME"],
+                                rec["STATE"],
+                                country_norm,
+                                rec["POST_CODE"],
+                                rec["DOB"],
+                                rec["IS_ACTIVE"],
+                                fp.name,
+                                pipeline_run_id,
+                            ]
+                        )
 
-        for i in range(0, len(quarantine_rows), CHUNK_SIZE):
-            cur.executemany(
-                """
-                INSERT INTO BRONZE.QUARANTINE_MEMBER_PROFILES (
-                    MEMBER_NAME, MEMBER_ID, ENROLLMENT_DATE, LAST_FLIGHT_DATE,
-                    TIER_CODE, AGENT_NAME, STATE, COUNTRY, POST_CODE, DATE_OF_BIRTH,
-                    ACTIVE_MEMBER, REJECT_REASON, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
+        with conn.cursor() as cur:
+            if rows_valid > 0:
+                _put_and_copy_csv(
+                    cur=cur,
+                    stage="@BRONZE.MEMBER_STAGE",
+                    file_format="BRONZE.CSV_STAGE_FMT",
+                    target_table="BRONZE.RAW_MEMBER_PROFILES",
+                    columns=RAW_MEMBER_COLUMNS,
+                    local_gz=valid_gz,
+                    subpath_prefix=f"valid_{pipeline_run_id}",
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-                """,
-                quarantine_rows[i : i + CHUNK_SIZE],
-            )
+            if rows_quarantined > 0:
+                _put_and_copy_csv(
+                    cur=cur,
+                    stage="@BRONZE.MEMBER_STAGE",
+                    file_format="BRONZE.CSV_STAGE_FMT",
+                    target_table="BRONZE.QUARANTINE_MEMBER_PROFILES",
+                    columns=QUARANTINE_MEMBER_COLUMNS,
+                    local_gz=quar_gz,
+                    subpath_prefix=f"quar_{pipeline_run_id}",
+                )
 
     return rows_read, rows_valid, rows_quarantined
 
 
 def ingest_json_files(conn: Any, json_files: list[Path], pipeline_run_id: str) -> tuple[int, int, int]:
+    if not json_files:
+        return 0, 0, 0
+
     payloads_read = 0
     flat_written = 0
     items_quarantined = 0
 
-    valid_raw_json_rows: list[tuple] = []
-    flat_rows: list[tuple] = []
+    valid_raw_json_rows: list[tuple[str, str, str]] = []
     quarantine_json_rows: list[tuple] = []
 
     for fp in json_files:
@@ -512,7 +688,7 @@ def ingest_json_files(conn: Any, json_files: list[Path], pipeline_run_id: str) -
                 )
                 continue
 
-            record_has_valid_item = False
+            valid_items: list[dict[str, Any]] = []
             for item in redemptions:
                 if not isinstance(item, dict):
                     items_quarantined += 1
@@ -573,70 +749,41 @@ def ingest_json_files(conn: Any, json_files: list[Path], pipeline_run_id: str) -
                         )
                     )
                 else:
-                    flat_written += 1
-                    record_has_valid_item = True
-                    flat_rows.append(
-                        (
-                            txn_id,
-                            member_id,
-                            feed_date_raw or None,
-                            txn_date_raw or None,
-                            partner or None,
-                            miles_raw_str or None,
-                            status or None,
-                            fp.name,
-                            pipeline_run_id,
-                        )
-                    )
+                    valid_items.append(item)
 
-            if record_has_valid_item:
-                valid_raw_json_rows.append((raw_json_str, fp.name, pipeline_run_id))
+            if valid_items:
+                clean_payload = dict(rec)
+                clean_payload["redemptions"] = valid_items
+                valid_raw_json_rows.append((json.dumps(clean_payload), fp.name, pipeline_run_id))
 
     with conn.cursor() as cur:
-        bulk_insert_variant_rows(
+        # 1. Stage & load raw JSON into BRONZE.RAW_REDEMPTION_JSON
+        _put_and_copy_raw_json(
             cur=cur,
-            table_name="BRONZE.RAW_REDEMPTION_JSON",
-            columns=["PAYLOAD", "SOURCE_FILE", "BATCH_ID"],
-            rows=valid_raw_json_rows,
-            variant_col_index=0,
+            stage="@BRONZE.REDEMPTION_JSON_STAGE",
+            file_format="BRONZE.JSON_STAGE_FMT",
+            payload_rows=valid_raw_json_rows,
+            subpath_prefix=f"raw_{pipeline_run_id}",
         )
 
-        for i in range(0, len(flat_rows), CHUNK_SIZE):
-            cur.executemany(
-                """
-                INSERT INTO BRONZE.REDEMPTION_JSON_FLAT (
-                    TXN_ID, MEMBER_ID, FEED_DATE_RAW, TXN_DATE_RAW,
-                    PARTNER, MILES_RAW, STATUS, SOURCE_FILE, BATCH_ID, BIW_LOAD_DATE
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-                """,
-                flat_rows[i : i + CHUNK_SIZE],
-            )
+        # 2. Flatten from BRONZE.RAW_REDEMPTION_JSON into BRONZE.REDEMPTION_JSON_FLAT
+        if valid_raw_json_rows:
+            flat_written = _flatten_raw_json_to_flat(cur, pipeline_run_id)
 
-        bulk_insert_variant_rows(
+        # 3. Stage & load quarantined JSON records/items
+        _put_and_copy_quarantine_json(
             cur=cur,
-            table_name="BRONZE.QUARANTINE_REDEMPTION_JSON",
-            columns=[
-                "RAW_PAYLOAD",
-                "MEMBER_ID",
-                "FEED_DATE_RAW",
-                "TXN_ID",
-                "TXN_DATE_RAW",
-                "PARTNER",
-                "MILES_RAW",
-                "STATUS",
-                "REJECT_REASON",
-                "SOURCE_FILE",
-                "BATCH_ID",
-            ],
-            rows=quarantine_json_rows,
-            variant_col_index=0,
+            stage="@BRONZE.REDEMPTION_JSON_STAGE",
+            file_format="BRONZE.JSON_STAGE_FMT",
+            quar_rows=quarantine_json_rows,
+            subpath_prefix=f"quar_{pipeline_run_id}",
         )
 
     return payloads_read, flat_written, items_quarantined
 
 
 def run_bronze_ingestion(flat_dir: Path, json_dir: Path) -> None:
+    started_at = datetime.now()
     pipeline_run_id = make_pipeline_run_id()
     member_files = (
         [
@@ -658,10 +805,6 @@ def run_bronze_ingestion(flat_dir: Path, json_dir: Path) -> None:
     print(f"[{pipeline_run_id}] Connecting to Snowflake...")
     conn = get_snowflake_connection()
     try:
-        with conn.cursor() as cur:
-            insert_audit_start(cur, pipeline_run_id, "BRONZE_INGEST")
-        conn.commit()
-
         loaded_members, loaded_redemptions = loaded_source_files(conn)
         pending_member_files = unprocessed_feed_files(member_files, loaded_members)
         pending_json_files = unprocessed_feed_files(json_files, loaded_redemptions)
@@ -678,42 +821,45 @@ def run_bronze_ingestion(flat_dir: Path, json_dir: Path) -> None:
         print(f"[{pipeline_run_id}] Processing {len(pending_json_files)} JSON file(s)...")
         j_read, j_flat, j_quar = ingest_json_files(conn, pending_json_files, pipeline_run_id)
 
+        conn.commit()
+
         total_read = m_read + j_read
         total_written = m_valid + j_flat
         total_quarantined = m_quar + j_quar
 
-        with conn.cursor() as cur:
-            insert_audit_finish(
-                cur,
-                pipeline_run_id,
-                "BRONZE_INGEST",
-                "SUCCESS",
-                total_read,
-                total_written,
-                total_quarantined,
-            )
-        conn.commit()
+        write_audit_entry(
+            conn=conn,
+            pipeline_run_id=pipeline_run_id,
+            stage="BRONZE_INGEST",
+            status="SUCCESS",
+            rows_read=total_read,
+            rows_written=total_written,
+            rows_quarantined=total_quarantined,
+            started_at=started_at,
+        )
 
         print(f"Pipeline Run ID: {pipeline_run_id} completed successfully.")
         print(f"Flat CSV ({flat_dir}) -> read: {m_read}, valid: {m_valid}, quarantined: {m_quar}")
-        print(f"JSON ({json_dir}) -> payloads read: {j_read}, flat written: {j_flat}, quarantined items/errors: {j_quar}")
+        print(
+            f"JSON ({json_dir}) -> payloads read: {j_read}, flat written: {j_flat}, "
+            f"quarantined items/errors: {j_quar}"
+        )
 
     except KeyboardInterrupt:
         print(f"\n[{pipeline_run_id}] Interrupted by user. Rolling back...")
         conn.rollback()
         try:
-            with conn.cursor() as cur:
-                insert_audit_finish(
-                    cur,
-                    pipeline_run_id,
-                    "BRONZE_INGEST",
-                    "CANCELLED",
-                    0,
-                    0,
-                    0,
-                    error_message="Interrupted by user",
-                )
-            conn.commit()
+            write_audit_entry(
+                conn=conn,
+                pipeline_run_id=pipeline_run_id,
+                stage="BRONZE_INGEST",
+                status="CANCELLED",
+                rows_read=0,
+                rows_written=0,
+                rows_quarantined=0,
+                started_at=started_at,
+                error_message="Interrupted by user",
+            )
         except Exception:
             pass
         sys.exit(1)
@@ -721,18 +867,17 @@ def run_bronze_ingestion(flat_dir: Path, json_dir: Path) -> None:
     except Exception as exc:
         conn.rollback()
         try:
-            with conn.cursor() as cur:
-                insert_audit_finish(
-                    cur,
-                    pipeline_run_id,
-                    "BRONZE_INGEST",
-                    "FAILED",
-                    0,
-                    0,
-                    0,
-                    error_message=str(exc),
-                )
-            conn.commit()
+            write_audit_entry(
+                conn=conn,
+                pipeline_run_id=pipeline_run_id,
+                stage="BRONZE_INGEST",
+                status="FAILED",
+                rows_read=0,
+                rows_written=0,
+                rows_quarantined=0,
+                started_at=started_at,
+                error_message=str(exc),
+            )
         except Exception:
             pass
         raise
@@ -745,7 +890,9 @@ def main() -> None:
     default_flat = Path(os.getenv("FLAT_DATA_FOLDER", "data/flat"))
     default_json = Path(os.getenv("JSON_DATA_FOLDER", "data/json"))
 
-    parser = argparse.ArgumentParser(description="Fetch CSV member and JSON redemption feeds into Snowflake Bronze.")
+    parser = argparse.ArgumentParser(
+        description="Stage and bulk-load CSV member and JSON redemption feeds into Snowflake Bronze."
+    )
     parser.add_argument(
         "--flat-dir",
         type=Path,

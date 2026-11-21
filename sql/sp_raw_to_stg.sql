@@ -7,6 +7,7 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    v_started_at      TIMESTAMP_NTZ := CURRENT_TIMESTAMP();
     v_run_id          VARCHAR;
     v_rows_read       NUMBER(38, 0) := 0;
     v_rows_written    NUMBER(38, 0) := 0;
@@ -15,16 +16,7 @@ DECLARE
     v_aus_count       NUMBER(38, 0) := 0;
     v_redemp_count    NUMBER(38, 0) := 0;
 BEGIN
-    v_run_id := TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS');
-
-    INSERT INTO AUDIT.PIPELINE_AUDIT (
-        PIPELINE_RUN_ID, STAGE, STATUS, ROWS_READ, ROWS_WRITTEN, ROWS_QUARANTINED,
-        ERROR_MESSAGE, STARTED_AT, BIW_LOAD_DATE
-    )
-    VALUES (
-        :v_run_id, 'RAW_TO_STG', 'RUNNING', 0, 0, 0,
-        NULL, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
-    );
+    v_run_id := TO_VARCHAR(:v_started_at, 'YYYYMMDD_HH24MISS');
 
     v_rows_read :=
         (SELECT COUNT(*) FROM BRONZE.RAW_MEMBER_PROFILES) +
@@ -316,7 +308,7 @@ BEGIN
     )
     VALUES (
         :v_run_id, 'RAW_TO_STG', 'SUCCESS', :v_rows_read, :v_rows_written, 0,
-        NULL, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+        NULL, :v_started_at, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
     );
 
     RETURN 'RAW_TO_STG completed [' || :v_run_id || '] -> IND: ' || :v_ind_count
@@ -332,7 +324,7 @@ EXCEPTION
         )
         VALUES (
             :v_run_id, 'RAW_TO_STG', 'FAILED', :v_rows_read, 0, 0,
-            LEFT(SQLERRM, 3900), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+            LEFT(SQLERRM, 3900), :v_started_at, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
         );
         RAISE;
 END;
