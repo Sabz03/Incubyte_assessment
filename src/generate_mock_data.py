@@ -58,10 +58,18 @@ def random_date(start_year: int, end_year: int) -> date:
     return start + timedelta(days=random.randint(0, max(1, delta_days)))
 
 
+def pick_last_flight_date(today: date, stale_ratio: float = 0.25) -> date:
+    """Return a recent flight date (<90d) most of the time, or >90d based on stale_ratio."""
+    if random.random() < stale_ratio:
+        return today - timedelta(days=random.randint(91, 240))
+    return today - timedelta(days=random.randint(0, 85))
+
+
 def build_member_line(
     idx: int,
     today: date,
     base_id: int = 223457,
+    stale_ratio: float = 0.25,
     force_bad: str | None = None,
 ) -> str:
     member_id = make_member_id(idx, base_id=base_id)
@@ -69,8 +77,8 @@ def build_member_line(
     last_name = random.choice(LAST_NAMES)
     member_name = f"{first_name} {last_name}"
 
-    enroll_dt = random_date(2010, today.year - 1)
-    last_flight_dt = random_date(2012, today.year)
+    enroll_dt = random_date(2010, max(2010, today.year - 1))
+    last_flight_dt = pick_last_flight_date(today, stale_ratio=stale_ratio)
     dob_dt = random_date(1965, 2002)
 
     country, state, post_codes = random.choice(VALID_LOCATIONS)
@@ -177,6 +185,7 @@ def generate_mock_files(
     count: int = 5000,
     run_date: date | None = None,
     base_id: int = 223457,
+    stale_ratio: float = 0.25,
 ) -> tuple[Path, Path]:
     flat_dir.mkdir(parents=True, exist_ok=True)
     json_dir.mkdir(parents=True, exist_ok=True)
@@ -210,14 +219,27 @@ def generate_mock_files(
     candidate_indices = list(range(2, count + 1)) if count > 1 else [1]
     quarantine_count = max(1, count // 100) if count >= 10 else 0
 
-    bad_indices_flat = set(random.sample(candidate_indices, k=min(len(candidate_indices), quarantine_count)))
-    bad_indices_json = set(random.sample(candidate_indices, k=min(len(candidate_indices), quarantine_count)))
+    bad_indices_flat = set(
+        random.sample(candidate_indices, k=min(len(candidate_indices), quarantine_count))
+    )
+    bad_indices_json = set(
+        random.sample(candidate_indices, k=min(len(candidate_indices), quarantine_count))
+    )
 
     with flat_path.open("w", encoding="utf-8", newline="\n") as f_flat:
         f_flat.write(CSV_HEADER + "\n")
         for idx in range(1, count + 1):
             bad_mode = random.choice(bad_modes_flat) if idx in bad_indices_flat else None
-            f_flat.write(build_member_line(idx, dt, base_id=base_id, force_bad=bad_mode) + "\n")
+            f_flat.write(
+                build_member_line(
+                    idx,
+                    dt,
+                    base_id=base_id,
+                    stale_ratio=stale_ratio,
+                    force_bad=bad_mode,
+                )
+                + "\n"
+            )
 
     json_records = []
     for idx in range(1, count + 1):
@@ -238,7 +260,7 @@ def main() -> None:
     default_json = Path(os.getenv("JSON_DATA_FOLDER", "data/json"))
 
     parser = argparse.ArgumentParser(
-        description="Generate 5,000 mock CSV member and JSON redemption records with <filename><YYYYMMDD> naming."
+        description="Generate mock CSV member and JSON redemption records with <filename><YYYYMMDD> naming."
     )
     parser.add_argument(
         "--flat-dir",
@@ -265,6 +287,12 @@ def main() -> None:
         help="Starting numeric Member_Id (default: 223457).",
     )
     parser.add_argument(
+        "--stale-ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of members with >90d flight inactivity ('Y'); default 0.25 means ~75%% 'N'.",
+    )
+    parser.add_argument(
         "--date",
         type=str,
         default=None,
@@ -279,10 +307,11 @@ def main() -> None:
         count=args.count,
         run_date=parsed_date,
         base_id=args.base_id,
+        stale_ratio=args.stale_ratio,
     )
     print(f"Flat CSV dumped ({args.count} records) -> {flat_file}")
     print(f"JSON file dumped ({args.count} records) -> {json_file}")
 
 
 if __name__ == "__main__":
-    main()
+    main() 
