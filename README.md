@@ -139,10 +139,10 @@ Incubyte_assessment/
 ├── src/
 │   ├── generate_mock_data.py      # Generates pipe-delimited member CSVs and JSON redemption feeds
 │   ├── ingest_to_bronze.py        # Bronze ingestion logic
-│   ├── regression_test.py         # Read-only Bronze/Silver/Gold/Audit checks, writes to AUDIT.TEST_AUDIT
 │   ├── run_pipeline.py            # Generates mock files, ingests to BRONZE, runs SILVER.SP_RAW_TO_STG()
 │   └── streamlit_app.py           # Streamlit dashboard querying GOLD.MEMBER_LOYALTY_SUMMARY
-├── tests/                        
+├── tests/ 
+|     └── regression_test.py         # Read-only Bronze/Silver/Gold/Audit checks, writes to audit tables                     
 ├── .env                           # Local Snowflake credentials (not committed)
 ├── .env.example                   # Template for required environment variables
 ├── .gitignore
