@@ -37,7 +37,7 @@ The pipeline stages compressed files into Snowflake internal stages, loads and v
 
 ### Input-layout assumption
 
-The implementation follows the field-position table and expects 11 detail fields, including `Post_Code`. The assessment's abbreviated sample detail lines omit `Post_Code`. The current parser does not automatically distinguish these layouts, so use the 11-field format or adapt the parser before loading the abbreviated sample. `MEMBER_ID` is used as the member key; names are not unique identifiers. `POST_CODE` is stored as text to preserve leading zeroes and support alphanumeric postal codes.
+The implementation accepts both layouts: 10 data fields when `Post_Code` is omitted and 11 data fields when `Post_Code` is present. `MEMBER_ID` is used as the member key; names are not unique identifiers. `POST_CODE` is stored as text to preserve leading zeroes and support alphanumeric postal codes.
 
 ---
 
@@ -198,8 +198,7 @@ cp .env.example .env              # fill in SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, S
 
 # 2. Prepare Snowflake objects and privileges
 #    Role/grant statements are in sql/ddl_tables.sql; there is no sql/grants.sql.
-#    On a fresh account, create SKYPOINTS_DB and its schemas before running the grant statements,
-#    because those statements refer to the database/schemas before the DDL creates them.
+#    The DDL creates the database and schemas before applying grants.
 #    Replace the <USER_NAME> placeholder and run the DDL with a role allowed to create roles/grant privileges.
 #    Ensure the role used by the Python jobs has the required table and stage privileges.
 #    ddl_tables.sql preserves existing tables, but replaces stage, file-format, and view definitions.

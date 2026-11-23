@@ -198,11 +198,28 @@ def parse_member_file(file_path: Path) -> list[dict[str, str]]:
 
             if record_type == "D":
                 data_cols = parts[1:]
-                if len(data_cols) < len(MEMBER_COLUMNS):
-                    data_cols = data_cols + [""] * (len(MEMBER_COLUMNS) - len(data_cols))
-                elif len(data_cols) > len(MEMBER_COLUMNS):
-                    data_cols = data_cols[: len(MEMBER_COLUMNS)]
-                records.append(dict(zip(MEMBER_COLUMNS, data_cols)))
+                if len(data_cols) == 10:
+                    ten_field_columns = [
+                        "MEMBER_NAME",
+                        "MEMBER_ID",
+                        "ENROLLMENT_DATE",
+                        "LAST_FLIGHT_DATE",
+                        "TIER_CODE",
+                        "AGENT_NAME",
+                        "STATE",
+                        "COUNTRY",
+                        "DOB",
+                        "IS_ACTIVE",
+                    ]
+                    row = dict(zip(ten_field_columns, data_cols))
+                    row["POST_CODE"] = ""
+                    records.append(row)
+                else:
+                    if len(data_cols) < len(MEMBER_COLUMNS):
+                        data_cols = data_cols + [""] * (len(MEMBER_COLUMNS) - len(data_cols))
+                    elif len(data_cols) > len(MEMBER_COLUMNS):
+                        data_cols = data_cols[: len(MEMBER_COLUMNS)]
+                    records.append(dict(zip(MEMBER_COLUMNS, data_cols)))
     return records
 
 
